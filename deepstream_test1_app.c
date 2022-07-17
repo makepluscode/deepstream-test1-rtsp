@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <cuda_runtime_api.h>
 #include "gstnvdsmeta.h"
+#include <gst/rtsp-server/rtsp-server.h>
 
 #define MAX_DISPLAY_LEN 64
 
@@ -109,9 +110,9 @@ osd_sink_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
         nvds_add_display_meta_to_frame(frame_meta, display_meta);
     }
 
-    g_print ("Frame Number = %d Number of objects = %d "
-            "Vehicle Count = %d Person Count = %d\n",
-            frame_number, num_rects, vehicle_count, person_count);
+    // g_print ("Frame Number = %d Number of objects = %d "
+    //         "Vehicle Count = %d Person Count = %d\n",
+    //         frame_number, num_rects, vehicle_count, person_count);
     frame_number++;
     return GST_PAD_PROBE_OK;
 }
@@ -144,18 +145,87 @@ bus_call (GstBus * bus, GstMessage * msg, gpointer data)
   return TRUE;
 }
 
+static GstRTSPServer *server;
+
+static gboolean
+start_rtsp_streaming (guint rtsp_port_num, guint updsink_port_num,
+    guint64 udp_buffer_size)
+{
+  GstRTSPMountPoints *mounts;
+  GstRTSPMediaFactory *factory;
+  char udpsrc_pipeline[512];
+
+  char port_num_Str[64] = { 0 };
+  char *encoder_name;
+
+  if (udp_buffer_size == 0)
+      udp_buffer_size = 512 * 1024;
+
+  sprintf (udpsrc_pipeline,
+            "( udpsrc name=pay0 port=%d buffer-size=%lu caps=\"application/x-rtp, media=video, "
+            "clock-rate=90000, encoding-name=H264, payload=96 \" )",
+            updsink_port_num, udp_buffer_size);
+
+  sprintf (port_num_Str, "%d", rtsp_port_num);
+
+  server = gst_rtsp_server_new ();
+  g_object_set (server, "service", port_num_Str, NULL);
+
+  mounts = gst_rtsp_server_get_mount_points (server);
+
+  factory = gst_rtsp_media_factory_new ();
+  gst_rtsp_media_factory_set_launch (factory, udpsrc_pipeline);
+
+  gst_rtsp_mount_points_add_factory (mounts, "/test", factory);
+
+  g_object_unref (mounts);
+
+  gst_rtsp_server_attach (server, NULL);
+
+  g_print("\n *** DeepStream: Launched RTSP Streaming at rtsp://localhost:%d/test ***\n\n", rtsp_port_num);
+
+  return TRUE;
+}
+
+static GstRTSPFilterResult
+client_filter (GstRTSPServer * server, GstRTSPClient * client,
+               gpointer user_data)
+{
+    return GST_RTSP_FILTER_REMOVE;
+}
+
+static void
+destroy_sink_bin ()
+{
+    GstRTSPMountPoints *mounts;
+    GstRTSPSessionPool *pool;
+
+    mounts = gst_rtsp_server_get_mount_points (server);
+    gst_rtsp_mount_points_remove_factory (mounts, "/test");
+    g_object_unref (mounts);
+    gst_rtsp_server_client_filter (server, client_filter, NULL);
+    pool = gst_rtsp_server_get_session_pool (server);
+    gst_rtsp_session_pool_cleanup (pool);
+    g_object_unref (pool);
+}
+
 int
 main (int argc, char *argv[])
 {
   GMainLoop *loop = NULL;
   GstElement *pipeline = NULL, *source = NULL, *h264parser = NULL,
       *decoder = NULL, *streammux = NULL, *sink = NULL, *pgie = NULL, *nvvidconv = NULL,
-      *nvosd = NULL;
+      *nvosd = NULL, *rtppay = NULL, *parse = NULL;
 
-  GstElement *transform = NULL;
   GstBus *bus = NULL;
   guint bus_watch_id;
   GstPad *osd_sink_pad = NULL;
+  GstElement *nvvidconv1 = NULL, *filter4 = NULL, *x264enc = NULL, *qtmux = NULL;
+  GstCaps *caps3 = NULL, *caps4 = NULL;
+
+  GstRTSPMountPoints *mounts;
+  GstRTSPMediaFactory *factory;
+  char udpsrc_pipeline[512];
 
   int current_device = -1;
   cudaGetDevice(&current_device);
@@ -203,20 +273,31 @@ main (int argc, char *argv[])
   /* Create OSD to draw on the converted RGBA buffer */
   nvosd = gst_element_factory_make ("nvdsosd", "nv-onscreendisplay");
 
-  /* Finally render the osd output */
-  if(prop.integrated) {
-    transform = gst_element_factory_make ("nvegltransform", "nvegl-transform");
-  }
-  sink = gst_element_factory_make ("nveglglessink", "nvvideo-renderer");
+  nvvidconv1 = gst_element_factory_make ("nvvideoconvert", "nvvideo-converter1");
 
-  if (!source || !h264parser || !decoder || !pgie
-      || !nvvidconv || !nvosd || !sink) {
-    g_printerr ("One element could not be created. Exiting.\n");
+  x264enc = gst_element_factory_make ("x264enc", "h264 encoder");
+
+  qtmux = gst_element_factory_make ("qtmux", "muxer");
+
+  filter4 = gst_element_factory_make ("capsfilter", "filter4");
+  caps4 = gst_caps_from_string ("video/x-raw, format=I420");
+  g_object_set (G_OBJECT (filter4), "caps", caps4, NULL);
+  gst_caps_unref (caps4);
+
+  if (!nvvidconv1 || !x264enc || !qtmux || !filter4) {
+    g_printerr ("One element could not be created. %p,%p,%p,%p, Exiting.\n",nvvidconv1, x264enc, qtmux,
+                filter4);
     return -1;
   }
 
-  if(!transform && prop.integrated) {
-    g_printerr ("One tegra element could not be created. Exiting.\n");
+  guint udp_port  = 5400;
+  parse = gst_element_factory_make ("h264parse", "h264-parser2");
+  rtppay = gst_element_factory_make ("rtph264pay", "rtp-payer");
+  sink = gst_element_factory_make ("udpsink", "udp-sink");
+
+  if (!source || !h264parser || !decoder || !pgie || !nvvidconv || !nvosd || !sink || !rtppay || !parse)
+  {
+    g_printerr ("One element could not be created. Exiting.\n");
     return -1;
   }
 
@@ -244,7 +325,7 @@ main (int argc, char *argv[])
   if(prop.integrated) {
     gst_bin_add_many (GST_BIN (pipeline),
         source, h264parser, decoder, streammux, pgie,
-        nvvidconv, nvosd, transform, sink, NULL);
+        nvvidconv, nvosd, nvvidconv1, filter4, x264enc, parse, rtppay, sink, NULL);
   }
   else {
   gst_bin_add_many (GST_BIN (pipeline),
@@ -286,8 +367,8 @@ main (int argc, char *argv[])
   }
 
   if(prop.integrated) {
-    if (!gst_element_link_many (streammux, pgie,
-        nvvidconv, nvosd, transform, sink, NULL)) {
+    if (!gst_element_link_many (streammux, pgie, nvvidconv, nvosd, nvvidconv1,
+        filter4, x264enc, parse, rtppay, sink, NULL)) {
       g_printerr ("Elements could not be linked: 2. Exiting.\n");
       return -1;
     }
@@ -299,6 +380,11 @@ main (int argc, char *argv[])
       return -1;
     }
   }
+
+  /* Start RTSP streaming */
+  g_object_set (G_OBJECT (sink), "host", "127.0.0.1", "port", udp_port, "async",
+    FALSE, "sync", 1, NULL);
+  start_rtsp_streaming (8554, udp_port, 0);
 
   /* Lets add probe to get informed of the meta data generated, we add probe to
    * the sink pad of the osd element, since by that time, the buffer would have
@@ -326,6 +412,7 @@ main (int argc, char *argv[])
   gst_element_set_state (pipeline, GST_STATE_NULL);
   g_print ("Deleting pipeline\n");
   gst_object_unref (GST_OBJECT (pipeline));
+  destroy_sink_bin();
   g_source_remove (bus_watch_id);
   g_main_loop_unref (loop);
   return 0;
